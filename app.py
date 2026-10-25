@@ -1,3 +1,22 @@
+"""
+Network Monitoring and Intrusion Detection System (IDS)
+Backend: Flask + Scapy
+Run as: sudo python app.py
+
+CHANGES SUMMARY:
+  - FIXED:   Scapy sniffing now uses a configurable interface + iface="any" fallback
+  - FIXED:   Flood detection now uses PACKETS_PER_SECOND (rate-based), not raw count
+  - FIXED:   Multiple alerts allowed per device (cooldown replaces one-shot 'suspicious' block)
+  - NEW:     UDP_FLOOD and TCP_FLOOD detected separately
+  - NEW:     DDoS detection — multiple IPs targeting the same destination
+  - NEW:     Alert cooldown per (ip, alert_type) to prevent spam
+  - NEW:     DEBUG flag for verbose logging
+  - NEW:     BURST detection (short spike window of 1 second)
+  - UPDATED: start_sniffing() uses iface + L2 socket for higher capture rate
+  - UPDATED: check_flood() now calculates real packets-per-second
+  - KEPT:    /devices, /traffic, /alerts, /domains, /analyze_csv all unchanged
+"""
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from scapy.all import sniff, IP, TCP, UDP, DNS, DNSQR, conf
@@ -11,49 +30,87 @@ from datetime import datetime
 app = Flask(__name__)
 CORS(app)
 
+# =============================================================================
+# ─── CONFIGURATION  (EDIT THESE TO MATCH YOUR SETUP) ─────────────────────────
+# =============================================================================
+
+# NEW: Set your interface here. "any" captures on ALL interfaces (recommended).
+# Change to "eth0", "wlan0", "lo", etc. if "any" doesn't work on your system.
 SNIFF_INTERFACE = "any"
+
+# NEW: Enable detailed console logging for debugging packet capture & detection.
+# Set to False in production to reduce noise.
 DEBUG = True
 
-# Flood / Rate-based thresholds 
+# ── Flood / Rate-based thresholds ────────────────────────────────────────────
 
+# UPDATED: Rate-based threshold — packets per second from a single IP.
 # hping3 easily sends 1000+ pps; 50 pps is clearly abnormal for normal traffic.
-PACKETS_PER_SECOND_THRESHOLD = 50  
+PACKETS_PER_SECOND_THRESHOLD = 50   # NEW: pps limit before flood alert fires
 
+# NEW: Burst threshold — packets seen within BURST_WINDOW_SEC (very short spike).
 # Even if Scapy misses some packets, a burst of 20 in 1 second is still caught.
-BURST_THRESHOLD    = 20     
-BURST_WINDOW_SEC   = 1 
-RATE_WINDOW_SEC = 2        
+BURST_THRESHOLD    = 20    # NEW
+BURST_WINDOW_SEC   = 1     # NEW: 1-second spike window
 
-# ── Port scan threshold
-PORT_SCAN_THRESHOLD = 20   
-PORT_SCAN_WINDOW_SEC = 5   
+# Sliding window size for rate calculation (last N seconds of timestamps kept).
+# UPDATED: reduced from 5s to 2s → faster detection, less stale data.
+RATE_WINDOW_SEC = 2        # UPDATED (was FLOOD_WINDOW_SEC = 5)
 
-# ── DDoS detection thresholds 
-DDOS_SOURCE_THRESHOLD = 3          
-DDOS_PPS_PER_SOURCE   = 20        
+# ── Port scan threshold ───────────────────────────────────────────────────────
+PORT_SCAN_THRESHOLD = 15   # unique destination ports
+PORT_SCAN_WINDOW_SEC = 5   # NEW: ports must be discovered within this many seconds
 
-# ── Alert cooldown
-ALERT_COOLDOWN_SEC = 10           
+# ── DDoS detection thresholds ─────────────────────────────────────────────────
+# NEW: How many different source IPs must be flooding the same destination
+# before we call it a DDoS (vs a single-source flood).
+DDOS_SOURCE_THRESHOLD = 3          # NEW: unique attacking IPs needed
+DDOS_PPS_PER_SOURCE   = 20         # NEW: each source must exceed this pps
+
+# ── Alert cooldown ────────────────────────────────────────────────────────────
+# NEW: Minimum seconds between two identical (ip, alert_type) alerts.
+# Prevents the same flood event from generating hundreds of log entries.
+ALERT_COOLDOWN_SEC = 10            # NEW
 
 # ── Suspicious domain keywords ────────────────────────────────────────────────
 SUSPICIOUS_KEYWORDS = ["malware", "phish", "hack", ".ru", ".xyz", ".tk"]
 
+# =============================================================================
+# ─── IN-MEMORY STORAGE ───────────────────────────────────────────────────────
+# =============================================================================
+
+# Per-device stats
 devices = {}
+
+# Alert log (latest appended; reversed when served via API)
 alerts = []
+
+# Global totals
 total_packets = 0
 total_bytes   = 0
 
+# UPDATED: Sliding-window timestamp list per source IP  { ip: [timestamps] }
 packet_times = defaultdict(list)
 
+# Per-device destination port set (port scan tracking)  { ip: { port: timestamp } }
 device_ports = defaultdict(dict)
 
+# NEW: Per-destination-IP: { dst_ip: { src_ip: [timestamps] } }
+# Used to detect DDoS (many sources → one target).
 ddos_tracker = defaultdict(lambda: defaultdict(list))
 
+# NEW: Cooldown tracker  { (ip, alert_type): last_alert_timestamp }
 alert_cooldown = {}
 
+# Thread lock for shared state
 lock = threading.Lock()
 
+# NEW: Counter for debug — total raw packets seen by handle_packet()
 _debug_pkt_counter = 0
+
+# =============================================================================
+# ─── HELPER UTILITIES ────────────────────────────────────────────────────────
+# =============================================================================
 
 def now_str():
     """Return current timestamp as a readable string."""
@@ -81,11 +138,33 @@ def ensure_device(ip):
             "icmp_packets": 0,
             "first_seen": now_str()
         }
-#ALERT SYSTEM
+
+
+# =============================================================================
+# ─── ALERT SYSTEM (UPDATED) ──────────────────────────────────────────────────
+# =============================================================================
+
+def get_alert_severity(alert_type):
+    """
+    NEW: Determine severity level based on alert type.
+    HIGH = immediate intrusion threat (floods, DDoS)
+    MEDIUM = reconnaissance/active probing (port scans)
+    LOW = suspicious activity (domains, etc.)
+    """
+    high_severity = {"TCP_FLOOD", "UDP_FLOOD", "DDOS"}
+    medium_severity = {"PORT_SCAN", "BURST"}
+    
+    if alert_type in high_severity:
+        return "HIGH"
+    elif alert_type in medium_severity:
+        return "MEDIUM"
+    else:
+        return "LOW"
+
 
 def can_alert(ip, alert_type):
     """
-    Cooldown check — returns True only if enough time has passed
+    NEW: Cooldown check — returns True only if enough time has passed
     since the last alert of this (ip, alert_type) combination.
     This prevents duplicate alert spam during sustained floods.
     """
@@ -99,16 +178,19 @@ def can_alert(ip, alert_type):
 
 def add_alert(alert_type, source_ip, message):
     """
-    Create and store a new alert.
+    UPDATED: Create and store a new alert with severity level.
     Now uses can_alert() cooldown — multiple alerts allowed per device,
     but not more than once per ALERT_COOLDOWN_SEC per (ip, type).
     Also marks the device as suspicious.
+    Also includes severity (HIGH/MEDIUM/LOW) for triage.
     """
     if not can_alert(source_ip, alert_type):
         return  # Still within cooldown window — skip duplicate
 
+    severity = get_alert_severity(alert_type)
     alert = {
         "type":      alert_type,
+        "severity":  severity,
         "source_ip": source_ip,
         "message":   message,
         "timestamp": now_str()
@@ -119,10 +201,36 @@ def add_alert(alert_type, source_ip, message):
     if source_ip in devices:
         devices[source_ip]["suspicious"] = True
 
-    print(f"[ALERT] {alert_type} from {source_ip}: {message}")
+    print(f"[ALERT] {severity} | {alert_type} from {source_ip}: {message}")
+
+
+# =============================================================================
+# ─── DETECTION FUNCTIONS (UPDATED / NEW) ─────────────────────────────────────
+# =============================================================================
 
 def check_flood(ip, protocol):
+    """
+    UPDATED: Rate-based flood detection using a sliding time window.
+
+    How it works:
+      1. Keep a list of timestamps (one per captured packet) for this IP.
+      2. Trim the list to only the last RATE_WINDOW_SEC seconds.
+      3. Calculate packets-per-second = count / window_size.
+      4. Also check for a short BURST (packets in last 1 second).
+      5. If pps > threshold OR burst > BURST_THRESHOLD → alert.
+
+    Why this is better than the old raw-count approach:
+      - Works even if Scapy only captures a fraction of real packets.
+        If hping3 sends 10,000 pps and Scapy only sees 200 (2%), that's
+        still 100 pps → well above PACKETS_PER_SECOND_THRESHOLD = 50.
+      - The 1-second burst window catches very short spikes that a
+        5-second window would dilute.
+
+    protocol: "UDP" or "TCP" — used to pick the right alert type.
+    """
     now = time.time()
+
+    # ── Trim to sliding window ──
     packet_times[ip] = [t for t in packet_times[ip] if now - t <= RATE_WINDOW_SEC]
     packet_times[ip].append(now)
 
@@ -157,8 +265,19 @@ def check_flood(ip, protocol):
             f"{protocol} burst spike: {burst_count} packets in 1 second"
         )
 
-def check_ddos(src_ip, dst_ip, protocol):
 
+def check_ddos(src_ip, dst_ip, protocol):
+    """
+    NEW: DDoS detection — many source IPs flooding the same destination.
+
+    Logic:
+      - Track timestamps per (dst_ip → src_ip) in ddos_tracker.
+      - For each source, calculate its pps towards this destination.
+      - Count how many sources exceed DDOS_PPS_PER_SOURCE.
+      - If that count >= DDOS_SOURCE_THRESHOLD → raise DDoS alert on dst_ip.
+
+    This distinguishes a DDoS from a single-source flood.
+    """
     now = time.time()
 
     # Keep only recent timestamps for this (dst, src) pair
@@ -175,24 +294,27 @@ def check_ddos(src_ip, dst_ip, protocol):
             active_attackers += 1
 
     if active_attackers >= DDOS_SOURCE_THRESHOLD:
-        # Alert is keyed to the target IP, not the source
-        if can_alert(dst_ip, "DDOS"):
-            alert = {
-                "type":      "DDOS",
-                "source_ip": dst_ip,   # dst_ip is the victim here
-                "message":   (f"DDoS attack on {dst_ip}: "
-                              f"{active_attackers} sources sending {protocol} flood"),
-                "timestamp": now_str()
-            }
-            alerts.append(alert)
-            print(f"[ALERT] DDOS targeting {dst_ip} from {active_attackers} sources")
-
-            # Mark the victim device as suspicious too
-            ensure_device(dst_ip)
-            devices[dst_ip]["suspicious"] = True
+        # Alert is keyed to the target IP (victim), not the source
+        ensure_device(dst_ip)
+        add_alert(
+            "DDOS",
+            dst_ip,
+            f"DDoS attack on {dst_ip}: "
+            f"{active_attackers} sources sending {protocol} flood"
+        )
 
 
 def check_port_scan(ip, port):
+    """
+    UPDATED: Port scan detection — now time-windowed.
+    
+    Instead of just counting unique ports (which generates false positives
+    from normal browsing, DNS, mail, etc.), we now detect rapid sequential
+    port probing: if many NEW ports are discovered within a short time
+    window (PORT_SCAN_WINDOW_SEC), that's indicative of actual scanning.
+    
+    Normal traffic spreads port connections over longer periods.
+    """
     now = time.time()
     
     # Clean old ports outside the window
@@ -218,7 +340,10 @@ def check_port_scan(ip, port):
 
 
 def check_suspicious_domain(ip, domain):
-
+    """
+    UPDATED: Suspicious domain check — now uses can_alert() cooldown
+    instead of one-time 'suspicious' flag guard.
+    """
     domain_lower = domain.lower()
     for keyword in SUSPICIOUS_KEYWORDS:
         if keyword in domain_lower:
@@ -230,8 +355,17 @@ def check_suspicious_domain(ip, domain):
             break
 
 
-def handle_packet(pkt):
+# =============================================================================
+# ─── PACKET HANDLER (UPDATED) ────────────────────────────────────────────────
+# =============================================================================
 
+def handle_packet(pkt):
+    """
+    UPDATED: Called by Scapy for every captured packet.
+    - Now detects UDP_FLOOD and TCP_FLOOD separately.
+    - Passes protocol type and dst_ip to detection functions.
+    - Includes debug counter to verify capture is working.
+    """
     global total_packets, total_bytes, _debug_pkt_counter
 
     if not pkt.haslayer(IP):
@@ -240,6 +374,8 @@ def handle_packet(pkt):
     src_ip  = pkt[IP].src
     dst_ip  = pkt[IP].dst    # NEW: needed for DDoS detection
     pkt_len = len(pkt)
+
+    # NEW: Debug packet counter — printed every 100 packets
     _debug_pkt_counter += 1
     if DEBUG and _debug_pkt_counter % 100 == 0:
         print(f"[DBG] Captured {_debug_pkt_counter} packets so far | "
@@ -253,11 +389,6 @@ def handle_packet(pkt):
         devices[src_ip]["packets"]  += 1
         devices[src_ip]["bytes"]    += pkt_len
         devices[src_ip]["last_seen"] = now_str()
-
-        # Skip threat detection for all loopback traffic to avoid false positives
-        # (Loopback packets are still counted for statistics)
-        if src_ip.startswith("127.") or dst_ip.startswith("127."):
-            return
 
         # ── Determine protocol and run flood detection ──
         if pkt.haslayer(UDP):
@@ -291,8 +422,31 @@ def handle_packet(pkt):
                     devices[src_ip]["domains"] = devices[src_ip]["domains"][-10:]
                 check_suspicious_domain(src_ip, domain)
 
+
+# =============================================================================
+# ─── PACKET SNIFFER (FIXED + UPDATED) ────────────────────────────────────────
+# =============================================================================
+
 def start_sniffing():
- 
+    """
+    FIXED: Improved sniffer setup.
+
+    Key changes vs original:
+    1. Uses SNIFF_INTERFACE (configurable) instead of no interface (system default).
+    2. Sets conf.sniff_promisc = True — captures ALL packets on the segment,
+       not just those addressed to this machine.
+    3. Uses L2socket via conf.L2listen for higher throughput on Linux.
+    4. Prints which interface is being used so you can verify.
+
+    Why 'any' interface?
+       When you run `hping3 -2 --flood <target>`, the flood packets may arrive
+       on eth0 or lo depending on routing. Using iface="any" ensures Scapy
+       sees them regardless.
+
+    Note: On some Kali systems 'any' may need libpcap 1.9+.
+    If it fails, change SNIFF_INTERFACE to "eth0" or "wlan0".
+    """
+    # FIXED: Enable promiscuous mode — capture all packets, not just ours
     conf.sniff_promisc = True
 
     print(f"[*] Starting packet capture on interface: '{SNIFF_INTERFACE}'")
@@ -309,15 +463,20 @@ def start_sniffing():
         # FIXED: iface parameter added; filter broadened to catch UDP flood
         sniff(
             iface=SNIFF_INTERFACE,
-            filter="ip",           
+            filter="ip",           # BPF filter — only IP packets (no ARP noise)
             prn=handle_packet,
-            store=False            
+            store=False            # Don't buffer packets in RAM
         )
     except Exception as e:
         print(f"[ERROR] Sniffing failed on '{SNIFF_INTERFACE}': {e}")
         print("[*] Retrying on default interface...")
-        
+        # FIXED: Fallback — try without specifying interface
         sniff(filter="ip", prn=handle_packet, store=False)
+
+
+# =============================================================================
+# ─── FLASK API ROUTES (UNCHANGED — all original routes kept working) ─────────
+# =============================================================================
 
 @app.route("/devices")
 def get_devices():
@@ -359,6 +518,7 @@ def get_domains():
 
 @app.route("/packet_stats")
 def get_packet_stats():
+    """Return detailed packet statistics per IP with protocol breakdown and rates."""
     with lock:
         stats = []
         current_time = time.time()
@@ -390,7 +550,10 @@ def get_packet_stats():
 
 @app.route("/analyze_csv", methods=["POST"])
 def analyze_csv():
-   
+    """
+    Accept CSV upload. Classify rows as Normal / Suspicious.
+    Rule: bytes > 1,000,000 OR packets > 500 → Suspicious.
+    """
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
@@ -427,6 +590,8 @@ def analyze_csv():
 
     return jsonify(results)
 
+
+# NEW: Debug endpoint — check live capture stats without opening the full dashboard
 @app.route("/debug")
 def debug_info():
     """NEW: Returns live capture stats for debugging. Hit this in browser to verify."""
@@ -457,7 +622,11 @@ def debug_info():
             }
         })
 
-# MAIN 
+
+# =============================================================================
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+# =============================================================================
+
 if __name__ == "__main__":
     # Start sniffer in a background daemon thread
     sniffer_thread = threading.Thread(target=start_sniffing, daemon=True)
