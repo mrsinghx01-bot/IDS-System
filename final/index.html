@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>IDS — Network Intrusion Detection System</title>
+  <script>
+    (function() {
+      const savedTheme = localStorage.getItem('ids-theme') || 'light';
+      document.documentElement.setAttribute('data-theme', savedTheme);
+    })();
+  </script>
+  <style>
+    /* ── RESET & FONTS ─────────────────────────────────────────── */
+    @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;400;600;700&display=swap');
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ── DESIGN TOKENS (LIGHT DEFAULT) ─────────────────────────── */
+    :root, [data-theme="light"] {
+      --bg:         #f8fafc;
+      --bg2:        #ffffff;
+      --bg3:        #f1f5f9;
+      --border:     rgba(203, 213, 225, 0.85);
+      --accent:     #2563eb;
+      --accent2:    #059669;
+      --danger:     #e11d48;
+      --warn:       #d97706;
+      --text:       #0f172a;
+      --text-dim:   #64748b;
+      --mono:       'Share Tech Mono', monospace;
+      --sans:       'Exo 2', sans-serif;
+      --radius:     8px;
+      --shadow:     0 4px 16px -2px rgba(15, 23, 42, 0.05);
+      --toggle-bg:  #e2e8f0;
+      --toggle-thumb: #ffffff;
+    }
+
+    [data-theme="dark"] {
+      --bg:         #0a0e17;
+      --bg2:        #0f1623;
+      --bg3:        #141c2e;
+      --border:     #1e2d4a;
+      --accent:     #00d4ff;
+      --accent2:    #00ff9d;
+      --danger:     #ff3e3e;
+      --warn:       #ffb300;
+      --text:       #c8d8f0;
+      --text-dim:   #5a7a9e;
+      --shadow:     none;
+      --toggle-bg:  #1e2d4a;
+      --toggle-thumb: #00d4ff;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      min-height: 100vh;
+      font-size: 14px;
+      transition: background-color 0.2s ease, color 0.2s ease;
+    }
+
+    /* ── SCANLINE OVERLAY (DARK ONLY) ───────────────────────────── */
+    [data-theme="dark"] body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,212,255,0.015) 2px,
+        rgba(0,212,255,0.015) 4px
+      );
+      pointer-events: none;
+      z-index: 9999;
+    }
+
+    /* ── HEADER ─────────────────────────────────────────────────── */
+    header {
+      background: var(--bg2);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 60px;
+      position: sticky; top: 0; z-index: 100;
+      transition: background-color 0.2s ease, border-color 0.2s ease;
+    }
+
+    .logo {
+      font-family: var(--mono);
+      font-size: 18px;
+      color: var(--accent);
+      letter-spacing: 2px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .logo-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--accent2);
+      box-shadow: 0 0 8px var(--accent2);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%,100% { opacity:1; transform:scale(1); }
+      50%      { opacity:.5; transform:scale(.8); }
+    }
+
+    .status-bar {
+      display: flex;
+      gap: 24px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+    .status-bar span { color: var(--accent); }
+
+    /* ── NAV ────────────────────────────────────────────────────── */
+    nav {
+      background: var(--bg2);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      padding: 0 24px;
+      gap: 4px;
+    }
+    .nav-btn {
+      padding: 12px 20px;
+      background: none;
+      border: none;
+      color: var(--text-dim);
+      font-family: var(--sans);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      text-transform: uppercase;
+      transition: color .2s, border-color .2s;
+    }
+    .nav-btn:hover { color: var(--text); }
+    .nav-btn.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+
+    /* ── MAIN LAYOUT ────────────────────────────────────────────── */
+    main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+    /* Pages hidden by default */
+    .page { display: none; }
+    .page.active { display: block; }
+
+    /* ── STAT CARDS ─────────────────────────────────────────────── */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .stat-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      position: relative;
+      overflow: hidden;
+    }
+    .stat-card::before {
+      content: '';
+      position: absolute; top: 0; left: 0; right: 0; height: 2px;
+      background: linear-gradient(90deg, var(--accent), transparent);
+    }
+    .stat-card.danger::before { background: linear-gradient(90deg, var(--danger), transparent); }
+    .stat-card.warn::before   { background: linear-gradient(90deg, var(--warn), transparent); }
+    .stat-card.green::before  { background: linear-gradient(90deg, var(--accent2), transparent); }
+
+    .stat-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      color: var(--text-dim);
+      margin-bottom: 8px;
+    }
+    .stat-value {
+      font-family: var(--mono);
+      font-size: 28px;
+      color: var(--accent);
+    }
+    .stat-card.danger .stat-value { color: var(--danger); }
+    .stat-card.warn   .stat-value { color: var(--warn); }
+    .stat-card.green  .stat-value { color: var(--accent2); }
+
+    /* ── SECTION HEADERS ────────────────────────────────────────── */
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .section-title {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+    .section-line {
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+    .refresh-badge {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--accent2);
+      background: rgba(0,255,157,.08);
+      border: 1px solid rgba(0,255,157,.2);
+      border-radius: 20px;
+      padding: 2px 10px;
+    }
+
+    /* ── TABLE ──────────────────────────────────────────────────── */
+    .table-wrap {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: auto;
+      margin-bottom: 24px;
+    }
+    table { width: 100%; border-collapse: collapse; }
+    thead th {
+      background: var(--bg3);
+      padding: 12px 16px;
+      text-align: left;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    tbody tr {
+      border-bottom: 1px solid rgba(30,45,74,.6);
+      transition: background .15s;
+    }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: rgba(0,212,255,.04); }
+    tbody tr.suspicious { background: rgba(255,62,62,.06); }
+    tbody tr.suspicious:hover { background: rgba(255,62,62,.10); }
+    td {
+      padding: 11px 16px;
+      font-size: 13px;
+      font-family: var(--mono);
+      vertical-align: middle;
+    }
+
+    /* ── BADGES ─────────────────────────────────────────────────── */
+    .badge {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      font-family: var(--sans);
+    }
+    .badge-ok      { background: rgba(0,255,157,.12); color: var(--accent2); border: 1px solid rgba(0,255,157,.3); }
+    .badge-danger  { background: rgba(255,62,62,.15);  color: var(--danger);  border: 1px solid rgba(255,62,62,.4); }
+    .badge-warn    { background: rgba(255,179,0,.12);  color: var(--warn);    border: 1px solid rgba(255,179,0,.3); }
+    .badge-flood   { background: rgba(255,62,62,.15);  color: #ff6b6b;        border: 1px solid rgba(255,62,62,.4); }
+    .badge-scan    { background: rgba(255,179,0,.12);  color: var(--warn);    border: 1px solid rgba(255,179,0,.3); }
+    .badge-domain  { background: rgba(180,0,255,.15);  color: #d070ff;        border: 1px solid rgba(180,0,255,.4); }
+
+    /* ── ALERT CARDS ────────────────────────────────────────────── */
+    .alert-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 24px; }
+    .alert-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--danger);
+      border-radius: var(--radius);
+      padding: 14px 18px;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 16px;
+      align-items: center;
+    }
+    .alert-card.PORT-SCAN    { border-left-color: var(--warn); }
+    .alert-card.SUSPICIOUS-DOMAIN { border-left-color: #a855f7; }
+    .alert-type  { font-family: var(--sans); font-weight: 700; font-size: 12px; white-space: nowrap; }
+    .alert-msg   { font-size: 13px; color: var(--text); }
+    .alert-ip    { font-family: var(--mono); font-size: 12px; color: var(--accent); margin-top: 2px; }
+    .alert-time  { font-family: var(--mono); font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+
+    /* ── DOMAINS TABLE ──────────────────────────────────────────── */
+    .domain-suspicious td { color: var(--danger); }
+
+    /* ── CSV UPLOAD ─────────────────────────────────────────────── */
+    .upload-area {
+      background: var(--bg2);
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 40px;
+      text-align: center;
+      margin-bottom: 24px;
+      transition: border-color .2s;
+    }
+    .upload-area:hover { border-color: var(--accent); }
+    .upload-area label {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      cursor: pointer;
+    }
+    .upload-icon { font-size: 40px; }
+    .upload-text { font-size: 14px; color: var(--text-dim); }
+    .upload-text span { color: var(--accent); }
+    #csv-file-input { display: none; }
+    .file-name-display {
+      margin-top: 8px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--accent2);
+    }
+
+    .btn {
+      display: inline-block;
+      padding: 10px 24px;
+      background: rgba(0,212,255,.1);
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      font-family: var(--sans);
+      font-weight: 700;
+      font-size: 13px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition: background .2s;
+      margin-bottom: 16px;
+    }
+    .btn:hover { background: rgba(0,212,255,.2); }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+    /* ── EMPTY STATE ────────────────────────────────────────────── */
+    .empty-state {
+      text-align: center;
+      padding: 48px;
+      color: var(--text-dim);
+      font-size: 13px;
+    }
+    .empty-icon { font-size: 32px; margin-bottom: 12px; }
+
+    /* ── DOMAINS TAG ────────────────────────────────────────────── */
+    .domain-tag {
+      display: inline-block;
+      background: rgba(0,212,255,.08);
+      border: 1px solid rgba(0,212,255,.2);
+      border-radius: 4px;
+      padding: 1px 6px;
+      margin: 1px;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    .domain-tag.bad {
+      background: rgba(255,62,62,.1);
+      border-color: rgba(255,62,62,.3);
+      color: var(--danger);
+    }
+
+    /* ── SCROLLBAR ──────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── BLINK EFFECT for live indicator ───────────────────────── */
+    .live-dot {
+      display: inline-block;
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--accent2);
+      margin-right: 6px;
+      animation: pulse 1.5s infinite;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── HEADER ─────────────────────────────────────────────────────────────── -->
+<header>
+  <div class="logo">
+    <div class="logo-dot"></div>
+    IDS <span style="color:var(--text-dim);font-size:12px;margin-left:4px">IDS</span>
+  </div>
+  <div class="header-right" style="display:flex;align-items:center;gap:20px;">
+    <div class="status-bar" id="header-stats">
+      <div>PACKETS <span id="h-packets">0</span></div>
+      <div>BYTES <span id="h-bytes">0</span></div>
+      <div>DEVICES <span id="h-devices">0</span></div>
+      <div>ALERTS <span id="h-alerts" style="color:var(--danger)">0</span></div>
+    </div>
+    <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" aria-label="Toggle light or dark theme" title="Toggle Light / Dark Theme" style="display:inline-flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--border);border-radius:100px;padding:4px 12px 4px 6px;cursor:pointer;color:var(--text-dim);font-family:var(--sans);font-size:12px;font-weight:600;">
+      <div style="width:38px;height:20px;background:var(--toggle-bg);border-radius:20px;position:relative;display:flex;align-items:center;justify-content:space-between;padding:0 4px;border:1px solid var(--border);">
+        <span style="font-size:10px;">☀️</span>
+        <span style="font-size:10px;">🌙</span>
+        <span id="theme-thumb" style="position:absolute;top:2px;left:2px;width:14px;height:14px;background:var(--toggle-thumb);border-radius:50%;box-shadow:0 1px 2px rgba(0,0,0,0.2);transition:transform 0.25s ease;"></span>
+      </div>
+      <span id="theme-label">Light</span>
+    </button>
+  </div>
+</header>
+
+<!-- ── NAV ───────────────────────────────────────────────────────────────── -->
+<nav>
+  <button class="nav-btn active" onclick="showPage('monitoring', this)">📡 Monitoring</button>
+  <button class="nav-btn" onclick="showPage('ids', this)">🛡 IDS Alerts</button>
+  <button class="nav-btn" onclick="showPage('domains', this)">🌐 DNS Domains</button>
+  <button class="nav-btn" onclick="showPage('csv', this)">📊 CSV Analysis</button>
+</nav>
+
+<!-- ── MAIN ───────────────────────────────────────────────────────────────── -->
+<main>
+
+  <!-- ══════════════════ PAGE 1: MONITORING ══════════════════ -->
+  <div class="page active" id="page-monitoring">
+
+    <!-- Stat cards row -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Total Packets</div>
+        <div class="stat-value" id="stat-packets">0</div>
+      </div>
+      <div class="stat-card green">
+        <div class="stat-label">Total Bytes</div>
+        <div class="stat-value" id="stat-bytes">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Active Devices</div>
+        <div class="stat-value" id="stat-devices">0</div>
+      </div>
+      <div class="stat-card warn">
+        <div class="stat-label">Suspicious</div>
+        <div class="stat-value" id="stat-suspicious">0</div>
+      </div>
+      <div class="stat-card danger">
+        <div class="stat-label">Total Alerts</div>
+        <div class="stat-value" id="stat-alerts">0</div>
+      </div>
+    </div>
+
+    <!-- Device table with Protocol Breakdown -->
+    <div class="section-header">
+      <span class="section-title">Packets by Source IP (Protocol Breakdown)</span>
+      <div class="section-line"></div>
+      <span class="refresh-badge"><span class="live-dot"></span>LIVE</span>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Source IP</th>
+            <th>Total Packets</th>
+            <th>TCP</th>
+            <th>UDP</th>
+            <th>ICMP</th>
+            <th>Packet Rate</th>
+            <th>Bytes</th>
+            <th>Domains</th>
+            <th>Last Seen</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="device-tbody">
+          <tr><td colspan="10" class="empty-state">
+            <div class="empty-icon">📡</div>
+            Waiting for network traffic...
+          </td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ══════════════════ PAGE 2: IDS ALERTS ══════════════════ -->
+  <div class="page" id="page-ids">
+
+    <div class="section-header">
+      <span class="section-title">Intrusion Detection Alerts</span>
+      <div class="section-line"></div>
+      <span class="refresh-badge"><span class="live-dot"></span>LIVE</span>
+    </div>
+
+    <div class="alert-list" id="alert-list">
+      <div class="empty-state">
+        <div class="empty-icon">✅</div>
+        No alerts yet. System is monitoring...
+      </div>
+    </div>
+
+    <!-- Suspicious devices quick view -->
+    <div class="section-header" style="margin-top:8px">
+      <span class="section-title">Suspicious Devices</span>
+      <div class="section-line"></div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>IP Address</th><th>Packets</th><th>Bytes</th><th>Last Seen</th>
+          </tr>
+        </thead>
+        <tbody id="suspicious-tbody">
+          <tr><td colspan="4" class="empty-state">
+            <div class="empty-icon">🛡</div>No suspicious devices
+          </td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ══════════════════ PAGE 3: DNS DOMAINS ══════════════════ -->
+  <div class="page" id="page-domains">
+
+    <div class="section-header">
+      <span class="section-title">Recent DNS Queries</span>
+      <div class="section-line"></div>
+      <span class="refresh-badge"><span class="live-dot"></span>LIVE</span>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Source IP</th>
+            <th>Domain Queried</th>
+            <th>Risk</th>
+          </tr>
+        </thead>
+        <tbody id="domain-tbody">
+          <tr><td colspan="3" class="empty-state">
+            <div class="empty-icon">🌐</div>No DNS queries captured yet
+          </td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ══════════════════ PAGE 4: CSV ANALYSIS ══════════════════ -->
+  <div class="page" id="page-csv">
+
+    <div class="section-header">
+      <span class="section-title">CSV Traffic Analysis</span>
+      <div class="section-line"></div>
+    </div>
+
+    <div class="upload-area">
+      <label for="csv-file-input">
+        <div class="upload-icon">📂</div>
+        <div class="upload-text">
+          Drop a CSV file here or <span>click to browse</span>
+        </div>
+        <div class="upload-text" style="font-size:12px">
+          Expected columns: ip, packets, bytes
+        </div>
+      </label>
+      <input type="file" id="csv-file-input" accept=".csv" onchange="handleFileSelect(this)"/>
+      <div class="file-name-display" id="csv-file-name"></div>
+    </div>
+
+    <button class="btn" id="analyze-btn" onclick="analyzeCSV()" disabled>Analyze CSV</button>
+
+    <div id="csv-results-wrap" style="display:none">
+      <div class="section-header">
+        <span class="section-title">Analysis Results</span>
+        <div class="section-line"></div>
+        <span id="csv-summary" class="refresh-badge"></span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead id="csv-thead"></thead>
+          <tbody id="csv-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<!-- ── JAVASCRIPT ─────────────────────────────────────────────────────────── -->
+<script>
+  const API = "http://localhost:5000";
+
+  // ── PAGE NAVIGATION ──────────────────────────────────────────────────────
+  function showPage(name, btn) {
+    document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+    document.querySelectorAll(".nav-btn").forEach(b => b.classList.remove("active"));
+    document.getElementById("page-" + name).classList.add("active");
+    btn.classList.add("active");
+  }
+
+  // ── UTILITY ──────────────────────────────────────────────────────────────
+  function fmtBytes(b) {
+    if (b < 1024) return b + " B";
+    if (b < 1048576) return (b/1024).toFixed(1) + " KB";
+    return (b/1048576).toFixed(2) + " MB";
+  }
+
+  const SUSPICIOUS_KEYWORDS = ["malware","phish","hack",".ru",".xyz",".tk"];
+  function isBadDomain(d) {
+    return SUSPICIOUS_KEYWORDS.some(k => d.toLowerCase().includes(k));
+  }
+
+  function alertClass(type) {
+    if (type === "FLOOD") return "badge-flood";
+    if (type === "PORT SCAN") return "badge-scan";
+    if (type === "SUSPICIOUS DOMAIN") return "badge-domain";
+    return "badge-warn";
+  }
+
+  // ── FETCH GLOBAL TRAFFIC STATS ────────────────────────────────────────────
+  async function fetchTraffic() {
+    try {
+      const r = await fetch(API + "/traffic");
+      const d = await r.json();
+
+      // Header
+      document.getElementById("h-packets").textContent = d.total_packets.toLocaleString();
+      document.getElementById("h-bytes").textContent   = fmtBytes(d.total_bytes);
+      document.getElementById("h-devices").textContent = d.total_devices;
+      document.getElementById("h-alerts").textContent  = d.total_alerts;
+
+      // Stat cards
+      document.getElementById("stat-packets").textContent   = d.total_packets.toLocaleString();
+      document.getElementById("stat-bytes").textContent     = fmtBytes(d.total_bytes);
+      document.getElementById("stat-devices").textContent   = d.total_devices;
+      document.getElementById("stat-suspicious").textContent = d.suspicious_count;
+      document.getElementById("stat-alerts").textContent    = d.total_alerts;
+    } catch(e) {
+      // Backend not reachable — silently ignore, will retry
+    }
+  }
+
+  // ── FETCH DEVICES ─────────────────────────────────────────────────────────
+  async function fetchDevices() {
+    try {
+      const r   = await fetch(API + "/packet_stats");
+      const devs = await r.json();
+
+      // ── Monitoring table with protocol breakdown ──
+      const tbody = document.getElementById("device-tbody");
+      if (devs.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="10" class="empty-state">
+          <div class="empty-icon">📡</div>Waiting for network traffic...</td></tr>`;
+      } else {
+        tbody.innerHTML = devs.map(d => {
+          const statusBadge = d.suspicious
+            ? `<span class="badge badge-danger">⚠ SUSPICIOUS</span>`
+            : `<span class="badge badge-ok">CLEAN</span>`;
+
+          return `<tr class="${d.suspicious ? 'suspicious' : ''}">
+            <td><strong>${d.ip}</strong></td>
+            <td>${d.total_packets.toLocaleString()}</td>
+            <td style="color:var(--accent)">${d.tcp_packets}</td>
+            <td style="color:var(--accent2)">${d.udp_packets}</td>
+            <td style="color:var(--warn)">${d.icmp_packets}</td>
+            <td><strong>${d.pps}</strong> pkt/s</td>
+            <td>${fmtBytes(d.bytes)}</td>
+            <td>${d.domains_accessed}</td>
+            <td style="color:var(--text-dim);font-size:12px">${d.last_seen}</td>
+            <td>${statusBadge}</td>
+          </tr>`;
+        }).join("");
+      }
+
+      // ── Also fetch original devices list for suspicious table and other needs ──
+      const devList = await fetch(API + "/devices").then(r => r.json());
+      
+      // ── Suspicious devices table (IDS page) ──
+      const suspDevs = devList.filter(d => d.suspicious);
+      const stbody = document.getElementById("suspicious-tbody");
+      if (suspDevs.length === 0) {
+        stbody.innerHTML = `<tr><td colspan="4" class="empty-state">
+          <div class="empty-icon">🛡</div>No suspicious devices</td></tr>`;
+      } else {
+        stbody.innerHTML = suspDevs.map(d => `
+          <tr class="suspicious">
+            <td>${d.ip}</td>
+            <td>${d.packets.toLocaleString()}</td>
+            <td>${fmtBytes(d.bytes)}</td>
+            <td style="color:var(--text-dim)">${d.last_seen}</td>
+          </tr>`).join("");
+      }
+
+    } catch(e) {}
+  }
+
+  // ── FETCH ALERTS ──────────────────────────────────────────────────────────
+  async function fetchAlerts() {
+    try {
+      const r      = await fetch(API + "/alerts");
+      const alerts = await r.json();
+
+      const container = document.getElementById("alert-list");
+      if (alerts.length === 0) {
+        container.innerHTML = `<div class="empty-state">
+          <div class="empty-icon">✅</div>No alerts yet. System is monitoring...</div>`;
+        return;
+      }
+
+      container.innerHTML = alerts.map(a => {
+        const cls = a.type.replace(" ", "-");
+        return `<div class="alert-card ${cls}">
+          <div>
+            <span class="badge ${alertClass(a.type)}">${a.type}</span>
+          </div>
+          <div>
+            <div class="alert-msg">${a.message}</div>
+            <div class="alert-ip">⟶ ${a.source_ip}</div>
+          </div>
+          <div class="alert-time">${a.timestamp}</div>
+        </div>`;
+      }).join("");
+    } catch(e) {}
+  }
+
+  // ── FETCH DOMAINS ─────────────────────────────────────────────────────────
+  async function fetchDomains() {
+    try {
+      const r       = await fetch(API + "/domains");
+      const domains = await r.json();
+
+      const tbody = document.getElementById("domain-tbody");
+      if (domains.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="3" class="empty-state">
+          <div class="empty-icon">🌐</div>No DNS queries captured yet</td></tr>`;
+        return;
+      }
+
+      // Latest first
+      tbody.innerHTML = [...domains].reverse().map(item => {
+        const bad = isBadDomain(item.domain);
+        const riskBadge = bad
+          ? `<span class="badge badge-danger">SUSPICIOUS</span>`
+          : `<span class="badge badge-ok">CLEAN</span>`;
+        return `<tr class="${bad ? 'domain-suspicious' : ''}">
+          <td>${item.ip}</td>
+          <td>${item.domain}</td>
+          <td>${riskBadge}</td>
+        </tr>`;
+      }).join("");
+    } catch(e) {}
+  }
+
+  // ── CSV FILE SELECT ───────────────────────────────────────────────────────
+  function handleFileSelect(input) {
+    const fname = input.files[0] ? input.files[0].name : "";
+    document.getElementById("csv-file-name").textContent = fname ? "📄 " + fname : "";
+    document.getElementById("analyze-btn").disabled = !fname;
+  }
+
+  // ── CSV ANALYZE ───────────────────────────────────────────────────────────
+  async function analyzeCSV() {
+    const fileInput = document.getElementById("csv-file-input");
+    if (!fileInput.files[0]) return;
+
+    const btn = document.getElementById("analyze-btn");
+    btn.disabled = true;
+    btn.textContent = "Analyzing...";
+
+    const formData = new FormData();
+    formData.append("file", fileInput.files[0]);
+
+    try {
+      const r = await fetch(API + "/analyze_csv", { method: "POST", body: formData });
+      const rows = await r.json();
+
+      if (rows.error) {
+        alert("Error: " + rows.error);
+        return;
+      }
+
+      // Build table headers from first row keys (excluding "status")
+      const keys = Object.keys(rows[0]).filter(k => k !== "status");
+
+      const thead = document.getElementById("csv-thead");
+      thead.innerHTML = `<tr>${keys.map(k => `<th>${k}</th>`).join("")}<th>Status</th></tr>`;
+
+      const suspicious = rows.filter(r => r.status === "Suspicious").length;
+      document.getElementById("csv-summary").textContent =
+        `${rows.length} rows · ${suspicious} suspicious`;
+
+      const tbody = document.getElementById("csv-tbody");
+      tbody.innerHTML = rows.map(row => {
+        const isSusp = row.status === "Suspicious";
+        const badge  = isSusp
+          ? `<span class="badge badge-danger">SUSPICIOUS</span>`
+          : `<span class="badge badge-ok">NORMAL</span>`;
+        return `<tr class="${isSusp ? 'suspicious' : ''}">
+          ${keys.map(k => `<td>${row[k] ?? "—"}</td>`).join("")}
+          <td>${badge}</td>
+        </tr>`;
+      }).join("");
+
+      document.getElementById("csv-results-wrap").style.display = "block";
+
+    } catch(e) {
+      alert("Could not connect to backend. Is the server running?");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Analyze CSV";
+    }
+  }
+
+  // ── THEME TOGGLE ──────────────────────────────────────────────────────────
+  function initTheme() {
+    const savedTheme = localStorage.getItem("ids-theme") || "light";
+    setTheme(savedTheme);
+  }
+
+  function setTheme(theme) {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("ids-theme", theme);
+    const label = document.getElementById("theme-label");
+    const thumb = document.getElementById("theme-thumb");
+    if (label) label.textContent = theme === "light" ? "Light" : "Dark";
+    if (thumb) thumb.style.transform = theme === "dark" ? "translateX(16px)" : "translateX(0)";
+  }
+
+  function toggleTheme() {
+    const currentTheme = document.documentElement.getAttribute("data-theme") || "light";
+    setTheme(currentTheme === "light" ? "dark" : "light");
+  }
+
+  initTheme();
+
+  // ── AUTO-REFRESH LOOP ─────────────────────────────────────────────────────
+  async function refresh() {
+    await fetchTraffic();
+    await fetchDevices();
+    await fetchAlerts();
+    await fetchDomains();
+  }
+
+  // Initial load + every 4 seconds
+  refresh();
+  setInterval(refresh, 4000);
+</script>
+</body>
+</html>
